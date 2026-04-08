@@ -291,7 +291,19 @@ Interpretation guide:
 If the loop never crosses 0 dB (UGF not found) or −180° (GM not found),
 the corresponding fields are `N/A`.
 
-**Raw waveform files** (`av`, `av_dB`, `av_ph`, unwrapped phase) are written to the same temporary directory as the generated corner netlists. Use `-k` to keep the temp directory and inspect the waveforms after the run.
+**Raw waveform files** are written to the temporary directory alongside the
+generated corner netlists. Use `-k` to keep the directory and inspect
+waveforms after the run.
+
+- **Tian probes:** raw files (`av`, `av_dB`, `av_ph`, unwrapped phase) are
+  always written by the generated `.control` block
+  (`<corner>_tian_1.raw`, etc.).
+- **Normal simulation:** raw files (`<corner>_norm.raw`) are only produced
+  if the netlist uses a `.control` block with a bare `write` command (no
+  filename argument). ngrun injects `set rawfile` after `.control` to
+  redirect the output to the per-corner path. Netlists using bare
+  dot-commands (`.tran`, `.meas` outside `.control`) do not produce raw
+  files.
 
 ---
 
