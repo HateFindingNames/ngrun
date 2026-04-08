@@ -922,12 +922,12 @@ def print_tian_summary(measures: Dict[str, str], corner_id: str = "",
 def _run_corner_worker(args_tuple) -> Dict:
     """
     Run one corner.  Designed to be called in-process or via ProcessPoolExecutor.
-    args_tuple: (corner, normal_path, tian_jobs, normal_rawfile, out_measures,
+    args_tuple: (corner, normal_path, tian_jobs, out_measures,
                  has_out, has_stb)
     tian_jobs: list of (tian_path, col_suffix) or empty list.
     normal_path may be None.
     """
-    corner, normal_path, tian_jobs, normal_rawfile, out_measures, has_out, has_stb = args_tuple
+    corner, normal_path, tian_jobs, out_measures, has_out, has_stb = args_tuple
 
     row = {
         "corner_id":   corner["id"],
@@ -939,7 +939,7 @@ def _run_corner_worker(args_tuple) -> Dict:
 
     if has_out and normal_path:
         try:
-            stdout, stderr, rc = _run_ngspice(normal_path, rawfile=normal_rawfile)
+            stdout, stderr, rc = _run_ngspice(normal_path)
             if rc != 0:
                 row.update({m: "SIM_ERROR" for m in out_measures})
             else:
@@ -1099,11 +1099,7 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
                       f"probe '{stb['probe']}': {e}")
                 tian_jobs.append((None, col_suffix))
 
-        normal_rawfile = (
-            os.path.splitext(normal_path)[0] + ".raw"
-            if normal_path else None
-        )
-        sim_args.append((corner, normal_path, tian_jobs, normal_rawfile,
+        sim_args.append((corner, normal_path, tian_jobs,
                          config.outputs, config.has_out, config.has_stb))
 
     print(f"  {n} netlist(s) created")
