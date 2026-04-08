@@ -93,7 +93,9 @@ different keys.
 ** ngr_lib models.lib(res_nom) res_nom res_fast res_slow
 ```
 
-The tool matches `.lib /any/path/models.lib <key>` and replaces `<key>`.
+The tool matches `.lib` statements by filename — both `.lib /any/path/models.lib <key>`
+and `.lib models.lib <key>` are matched. Only `<key>` is replaced; the path
+(if present) is preserved.
 
 ---
 
@@ -115,20 +117,45 @@ temperature (usually 27°C, unless `.temp` is already in the netlist).
 
 ---
 
-### `ngr_out` — output measures
+### `ngr_out` — output values to extract
 
 ```spice
-** ngr_out <measure1> [measure2 ...]
+** ngr_out <name1> [name2 ...]
 ```
 
-Names of `.measure` results to extract from the normal simulation.
-Each name must match a `.measure` statement in the netlist.
+Names of values to extract from the ngspice output of the normal simulation.
+The tool searches ngspice's stdout for lines matching `name = value` — the
+format produced by both `.measure` results and `print` statements inside
+`.control` blocks.
+
+This means `ngr_out` can extract:
+
+- **`.measure` results** — the standard use case:
 
 ```spice
-** ngr_out trise tfall power_avg vout_dc
+.meas tran trise trig v(out) val=0.5 rise=1 targ v(out) val=1.3 rise=1
 ```
 
-Output values appear as columns in the CSV. If a measure is not found in
+- **Calculated values via `let` + `print`** — useful when the quantity you
+  need is derived from a measurement rather than measured directly:
+
+```spice
+.control
+run
+meas tran period trig v(clk) td=5u val=0.5 rise=1 targ v(clk) td=5u val=0.5 rise=6
+let frequency = 5/period
+print frequency
+.endc
+```
+
+Both produce output lines of the form `name = value` that ngrun can extract.
+The corresponding `ngr_out` directive would be:
+
+```spice
+** ngr_out trise period frequency
+```
+
+Output values appear as columns in the CSV. If a name is not found in
 ngspice output, the field is set to `N/A`.
 
 ---
@@ -143,6 +170,11 @@ Instruments the netlist with a Tian probe at the specified pin and runs a
 separate two-sweep AC simulation to extract loop gain, phase margin, and gain
 margin.
 
+Multiple `ngr_stb` directives are supported. Each runs as an independent
+Tian analysis per corner (sequential, not simultaneous). The first probe
+uses bare column names (`a0_db`, `pm`, ...); subsequent probes append
+`_2`, `_3`, etc. (`a0_db_2`, `pm_2`, ...).
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `fstart`  | `1`     | Start frequency, Hz |
@@ -154,16 +186,13 @@ margin.
 ** ngr_stb ota.out fstart=1 fstop=1e9 pts=100
 ```
 
-Only one `ngr_stb` directive is allowed per netlist. If multiple are present,
-the first is used and a warning is printed.
-
 #### Probe specification
 
 Two forms are supported, and they can be mixed in a hierarchical path:
 
 **`inst.pinname`** — resolve by pin name. Requires the subcircuit definition
-to be present in the netlist or an included file. Works for all devices whose
-model is defined in the netlist.
+to be present in the netlist file (not in externally `.include`d or `.lib`
+files). Works for all devices whose subcircuit is defined in the netlist.
 
 **`inst:N`** — resolve by 1-based pin position as written on the instance
 line. Does not require the subcircuit definition. Use this for library-only
@@ -240,6 +269,10 @@ IEEE Circuits & Devices, vol. 17, no. 1, pp. 31–41, Jan. 2001.
 | `gm_freq` | Gain-margin frequency in Hz (−180° crossing) |
 | `gm_db` | Gain margin in dB |
 
+When multiple `ngr_stb` directives are present, the second probe's columns
+are suffixed `_2` (`a0_db_2`, `pm_2`, ...), the third `_3`, and so on.
+The first probe always uses the bare names above.
+
 Interpretation guide:
 
 | PM | Assessment |
@@ -281,13 +314,15 @@ when you only want to run the stability analysis on the nominal design.
 | `ngr_out` | `ngr_stb` | Runs per corner |
 |----------|----------|-----------------|
 | yes | no | 1 (normal) |
-| no | yes | 1 (Tian) |
-| yes | yes | 2 (normal + Tian, results merged) |
+| no | 1 probe | 1 (Tian) |
+| no | N probes | N (one Tian per probe) |
+| yes | 1 probe | 2 (normal + Tian, results merged) |
+| yes | N probes | 1 + N (normal + N Tian, all merged) |
 | no | no | 1 (normal, nothing extracted — warning) |
 
 When both are present, the normal simulation uses the original corner netlist.
-The Tian simulation uses a separately instrumented copy. The two sets of
-results are merged into one CSV row per corner.
+Each Tian simulation uses an independently instrumented copy (built fresh
+from the corner netlist). All results are merged into one CSV row per corner.
 
 ---
 
@@ -314,7 +349,7 @@ Results are written to `<netlist>_results.csv` by default.
 **Column order:**
 
 ```
-corner_id | temperature | param_<name>... | lib_<name>... | <ngr_out measures>... | a0_db | ugf_freq | pm | gm_freq | gm_db
+corner_id | temperature | param_<name>... | lib_<name>... | <ngr_out values>... | a0_db | ugf_freq | pm | gm_freq | gm_db
 ```
 
 - `corner_id`: `c0001`, `c0002`, ... for corner sweeps; `typ` for `--typ` mode
@@ -322,6 +357,7 @@ corner_id | temperature | param_<name>... | lib_<name>... | <ngr_out measures>..
 - `param_*`: one column per swept parameter
 - `lib_*`: one column per swept library (name includes the key if specified)
 - Stability columns are only present if `ngr_stb` is defined
+- With multiple `ngr_stb` probes, the second set is suffixed `_2`, third `_3`, etc.
 
 **Example rows:**
 
@@ -380,6 +416,30 @@ python3 ngrun.py ldo.sp -j 4
 
 ---
 
+### Multiple stability probes
+
+```spice
+* LDO with inner and outer loop stability
+** ngr_param vdd_p 3.0 3.3 3.6
+** ngr_lib models.lib(tt) tt ff ss
+** ngr_temp -40 27 125
+** ngr_out vout_dc
+** ngr_stb erramp.out fstart=1 fstop=100e6 pts=50
+** ngr_stb rfb:1 fstart=1 fstop=10e6
+
+.lib /pdk/models.lib tt
+.param vdd_p=3.3
+...
+```
+
+```bash
+python3 ngrun.py ldo.sp -j 4
+# 27 corners × 3 sims each (1 normal + 2 Tian), 4 parallel workers
+# CSV columns: vout_dc, a0_db, ugf_freq, pm, gm_freq, gm_db, a0_db_2, ugf_freq_2, pm_2, gm_freq_2, gm_db_2
+```
+
+---
+
 ### Typical run only
 
 ```bash
@@ -402,6 +462,11 @@ python3 ngrun.py ldo.sp -k -n
 
 ## Notes and limitations
 
+**Parameter validation:** `ngr_param` names are checked against `.param`
+statements in the netlist at startup. A warning is printed if a swept
+parameter name has no matching `.param` — this catches typos before running
+a potentially long corner sweep.
+
 **Hierarchical probing** creates a clone of each subcircuit along the probe
 path (named with a `_stb` suffix). This ensures that only the targeted
 instance is modified; other instantiations of the same subcircuit are
@@ -412,19 +477,19 @@ on existing V/I sources are set to zero. The probe's `Vi_stb` and `Ii_stb`
 sources are then the only active AC stimulus. This is required for correct
 loop gain extraction.
 
-**Parallel execution** (`-j N`) parallelizes at the corner level. Both
-simulations for a given corner (normal + Tian) run sequentially within one
-worker process. Different corners run in parallel.
+**Parallel execution** (`-j N`) parallelizes at the corner level. All
+simulations for a given corner (normal + Tian probes) run sequentially within
+one worker process. Different corners run in parallel.
 
 **Stability + measures incompatibility:** ngr_stb and ngr_out simulations
 cannot share a netlist. The Tian-instrumented netlist has modified AC sources
 and extra probe elements that would corrupt `.measure` results. ngrun handles
 this automatically by running them as two separate simulations.
 
-**`.lib` path matching** requires the library filename to appear at the end
-of the path component in the `.lib` statement:
-`.lib /path/to/models.lib key` — the tool matches on `models.lib` only,
-not the full path. The full path is preserved in substitution.
+**`.lib` path matching** matches the library filename at the end of the path
+in the `.lib` statement. Both full paths and bare filenames are supported:
+`.lib /path/to/models.lib key` and `.lib models.lib key` both match on
+`models.lib`. The full path (if present) is preserved in substitution.
 
 **ngspice version requirement for stability analysis:** the `unwrap()` command used for phase unwrapping was introduced in ngspice 37. Earlier versions will fail when `ngr_stb` is active. Check your version with `ngspice --version`.
 

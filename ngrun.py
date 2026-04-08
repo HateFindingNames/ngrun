@@ -35,18 +35,27 @@ They must start with 'ngr_' to be recognised.
      ** ngr_temp -40 27 125
    Temperatures in Celsius.
 
-4. ngr_out - Measurements to extract (from .measure statements)
-   Syntax: ** ngr_out <meas1> <meas2> ... <measN>
+4. ngr_out - Output values to extract
+   Syntax: ** ngr_out <name1> <name2> ... <nameN>
    Example:
-     ** ngr_out trise tfall power_avg
-   Results written to CSV. Requires a normal simulation (not Tian-only).
+     ** ngr_out trise tfall power_avg frequency
+   Extracts named values from the ngspice stdout. Works with both:
+     - .measure results:   .meas tran trise trig ... targ ...
+     - printed variables:  let frequency = 5/period
+                           print frequency
+   The tool searches ngspice output for lines matching 'name = value'
+   (the format used by both .meas and print). Results appear as CSV columns.
+   If a name is not found in the output, its field is set to N/A.
 
-5. ngr_stb - Tian stability probe (one probe per netlist for now)
+5. ngr_stb - Tian stability probe (multiple probes supported)
    Syntax: ** ngr_stb <probe> [fstart=<f>] [fstop=<f>] [pts=<n>]
    Examples:
      ** ngr_stb ota.out
      ** ngr_stb reg.erramp.out fstart=0.1 fstop=1e9 pts=50
      ** ngr_stb xr1:1
+   Multiple ngr_stb directives run sequential Tian analyses per corner.
+   First probe uses bare column names (a0_db, pm, ...); subsequent probes
+   append _2, _3, etc. (a0_db_2, pm_2, ...).
    Probe specification - two forms:
      inst.pinname    - resolve by pin name (requires subckt definition in netlist)
      inst:N          - resolve by 1-based pin position (always works)
@@ -631,7 +640,7 @@ class NgConfig:
         self.libs: Dict[Tuple[str, Optional[str]], List[str]] = {}
         self.temps: List[str] = []
         self.outputs: List[str] = []
-        self.stb: Optional[Dict] = None  # {probe, fstart, fstop, pts}
+        self.stb_list: List[Dict] = []  # [{probe, fstart, fstop, pts}, ...]
 
     @property
     def has_corners(self):
@@ -643,7 +652,7 @@ class NgConfig:
 
     @property
     def has_stb(self):
-        return self.stb is not None
+        return bool(self.stb_list)
 
 
 def parse_ng_directives(lines: List[str]) -> NgConfig:
@@ -683,9 +692,6 @@ def parse_ng_directives(lines: List[str]) -> NgConfig:
             config.outputs = args
 
         elif cmd == "ngr_stb":
-            if config.stb is not None:
-                print("Warning: multiple ngr_stb directives; only the first is used.")
-                continue
             if not args:
                 print(f"Warning: ngr_stb requires a probe spec: {s}")
                 continue
@@ -700,7 +706,7 @@ def parse_ng_directives(lines: List[str]) -> NgConfig:
                         print(f"Warning: invalid value for ngr_stb {k}: {m.group(2)}")
                 else:
                     print(f"Warning: unknown ngr_stb option: {kv}")
-            config.stb = stb
+            config.stb_list.append(stb)
 
     return config
 
@@ -777,8 +783,8 @@ class CornerGenerator:
         with open(path, "w") as f:
             f.write(self.build_corner_text(corner))
 
-    def write_tian_netlist(self, corner: Dict, path: str, raw_file: str, base_dir: str):
-        stb = self.config.stb
+    def write_tian_netlist(self, corner: Dict, path: str, raw_file: str,
+                          base_dir: str, stb: Dict):
         text = instrument_netlist_tian(
             self.build_corner_text(corner),
             stb["probe"], stb["fstart"], stb["fstop"], stb["pts"],
@@ -792,6 +798,20 @@ class CornerGenerator:
 # ---------------------------------------------------------------------------
 
 STB_MEASURES = ["a0_db", "ugf_freq", "pm", "gm_freq", "gm_db"]
+
+
+def _stb_col_suffix(stb_index: int, n_stb: int) -> str:
+    """Return column suffix for a given stb probe index.
+    First probe (index 0) gets no suffix; subsequent probes get _2, _3, ..."""
+    if n_stb <= 1 or stb_index == 0:
+        return ""
+    return f"_{stb_index + 1}"
+
+
+def _stb_columns(stb_index: int, n_stb: int) -> List[str]:
+    """Return the list of CSV column names for a given stb probe."""
+    suffix = _stb_col_suffix(stb_index, n_stb)
+    return [m + suffix for m in STB_MEASURES]
 
 
 def _run_ngspice(path: str, timeout: int = 600,
@@ -814,29 +834,37 @@ def _extract_measures(output: str, names: List[str]) -> Dict[str, str]:
     return out
 
 
-def _extract_tian_measures(stdout: str, stderr: str) -> Dict[str, str]:
+def _extract_tian_measures(stdout: str, stderr: str,
+                           col_suffix: str = "") -> Dict[str, str]:
     """
     Extract Tian results.
     a0_db / ugf_freq / gm_freq come from .meas; pm / gm_db from print.
     PM is normalised to (-180, 180] to correct for unwrap-induced offsets.
+    col_suffix is appended to each key (e.g. "" or "_2").
     """
     combined = stdout + "\n" + stderr
-    results = _extract_measures(combined, STB_MEASURES)
+    # Always extract using the bare measure names (ngspice doesn't know about suffixes)
+    raw = _extract_measures(combined, STB_MEASURES)
     # Normalise PM to (-180, 180]: ((pm + 180) % 360) - 180
-    # Handles cases where wrapped phase at UGF lands outside the expected
-    # range, e.g. 389 deg -> 29 deg, while preserving negative PM correctly.
-    pm_raw = results.get("pm", "N/A")
+    pm_raw = raw.get("pm", "N/A")
     if pm_raw not in ("N/A", "SIM_ERROR", "TIMEOUT", "ERROR"):
         try:
             pm_norm = ((float(pm_raw) + 180.0) % 360.0) - 180.0
-            results["pm"] = str(pm_norm)
+            raw["pm"] = str(pm_norm)
         except ValueError:
             pass
-    return results
+    # Apply suffix to keys
+    return {m + col_suffix: raw[m] for m in STB_MEASURES}
 
 
-def print_tian_summary(measures: Dict[str, str], corner_id: str = ""):
-    label = f" [{corner_id}]" if corner_id else ""
+def print_tian_summary(measures: Dict[str, str], corner_id: str = "",
+                       probe_label: str = "", col_suffix: str = ""):
+    parts = []
+    if corner_id:
+        parts.append(corner_id)
+    if probe_label:
+        parts.append(probe_label)
+    label = f" [{', '.join(parts)}]" if parts else ""
     print()
     print("=" * 52)
     print(f"  Tian Stability Results{label}")
@@ -850,11 +878,12 @@ def print_tian_summary(measures: Dict[str, str], corner_id: str = ""):
         except (ValueError, TypeError):
             return str(v)
 
-    a0     = measures.get("a0_db",   "N/A")
-    ugf    = measures.get("ugf_freq","N/A")
-    pm     = measures.get("pm",      "N/A")
-    gm_f   = measures.get("gm_freq", "N/A")
-    gm_db  = measures.get("gm_db",   "N/A")
+    s = col_suffix
+    a0     = measures.get(f"a0_db{s}",   "N/A")
+    ugf    = measures.get(f"ugf_freq{s}","N/A")
+    pm     = measures.get(f"pm{s}",      "N/A")
+    gm_f   = measures.get(f"gm_freq{s}", "N/A")
+    gm_db  = measures.get(f"gm_db{s}",   "N/A")
 
     print(f"  DC Loop Gain (a0):   {a0 if a0 == 'N/A' else a0+' dB'}")
     print(f"  Unity Gain Freq:     {fmt_freq(ugf) if ugf != 'N/A' else 'NOT FOUND'}")
@@ -893,10 +922,12 @@ def print_tian_summary(measures: Dict[str, str], corner_id: str = ""):
 def _run_corner_worker(args_tuple) -> Dict:
     """
     Run one corner.  Designed to be called in-process or via ProcessPoolExecutor.
-    args_tuple: (corner, normal_path, tian_path, out_measures, has_out, has_stb)
-    normal_path / tian_path may be None.
+    args_tuple: (corner, normal_path, tian_jobs, normal_rawfile, out_measures,
+                 has_out, has_stb)
+    tian_jobs: list of (tian_path, col_suffix) or empty list.
+    normal_path may be None.
     """
-    corner, normal_path, tian_path, normal_rawfile, out_measures, has_out, has_stb = args_tuple
+    corner, normal_path, tian_jobs, normal_rawfile, out_measures, has_out, has_stb = args_tuple
 
     row = {
         "corner_id":   corner["id"],
@@ -918,17 +949,21 @@ def _run_corner_worker(args_tuple) -> Dict:
         except Exception:
             row.update({m: "ERROR" for m in out_measures})
 
-    if has_stb and tian_path:
+    for tian_path, col_suffix in tian_jobs:
+        cols = [m + col_suffix for m in STB_MEASURES]
+        if tian_path is None:
+            row.update({c: "PROBE_ERROR" for c in cols})
+            continue
         try:
             stdout, stderr, rc = _run_ngspice(tian_path)
             if rc != 0:
-                row.update({m: "SIM_ERROR" for m in STB_MEASURES})
+                row.update({c: "SIM_ERROR" for c in cols})
             else:
-                row.update(_extract_tian_measures(stdout, stderr))
+                row.update(_extract_tian_measures(stdout, stderr, col_suffix))
         except subprocess.TimeoutExpired:
-            row.update({m: "TIMEOUT" for m in STB_MEASURES})
+            row.update({c: "TIMEOUT" for c in cols})
         except Exception:
-            row.update({m: "ERROR" for m in STB_MEASURES})
+            row.update({c: "ERROR" for c in cols})
 
     return row
 
@@ -968,40 +1003,49 @@ def run_typ(netlist_path: str, config: NgConfig, output_file: str):
         finally:
             os.unlink(npath)
 
-    # Tian simulation
+    # Tian simulation(s)
     if config.has_stb:
-        stb = config.stb
-        raw_file = os.path.join(tempfile.gettempdir(), f"ngrun_{base_name}_typ_tian.raw")
-        try:
-            tian_text = instrument_netlist_tian(
-                netlist_text, stb["probe"],
-                stb["fstart"], stb["fstop"], stb["pts"],
-                raw_file, base_dir)
-        except ValueError as e:
-            print(f"[ngrun] Error instrumenting netlist: {e}", file=sys.stderr)
-            row.update({m: "PROBE_ERROR" for m in STB_MEASURES})
-            tian_text = None
-
-        if tian_text:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".sp",
-                                             prefix="ngrun_typ_tian_", delete=False) as tf:
-                tf.write(tian_text)
-                tpath = tf.name
+        n_stb = len(config.stb_list)
+        for si, stb in enumerate(config.stb_list):
+            col_suffix = _stb_col_suffix(si, n_stb)
+            cols = _stb_columns(si, n_stb)
+            probe_label = stb["probe"]
+            raw_file = os.path.join(tempfile.gettempdir(),
+                                    f"ngrun_{base_name}_typ_tian_{si+1}.raw")
             try:
-                print("[ngrun] Running Tian stability simulation (--typ)...")
-                stdout, stderr, rc = _run_ngspice(tpath)
-                if rc != 0:
-                    print(f"[ngrun] ngspice error (rc={rc})")
-                    print((stdout + stderr)[-3000:])
-                    row.update({m: "SIM_ERROR" for m in STB_MEASURES})
-                else:
-                    stb_res = _extract_tian_measures(stdout, stderr)
-                    row.update(stb_res)
-                    print_tian_summary(stb_res)
-                    if os.path.isfile(raw_file):
-                        print(f"[ngrun] Raw file: {raw_file}")
-            finally:
-                os.unlink(tpath)
+                tian_text = instrument_netlist_tian(
+                    netlist_text, stb["probe"],
+                    stb["fstart"], stb["fstop"], stb["pts"],
+                    raw_file, base_dir)
+            except ValueError as e:
+                print(f"[ngrun] Error instrumenting netlist for probe "
+                      f"'{probe_label}': {e}", file=sys.stderr)
+                row.update({c: "PROBE_ERROR" for c in cols})
+                tian_text = None
+
+            if tian_text:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".sp",
+                                                 prefix=f"ngrun_typ_tian{si+1}_",
+                                                 delete=False) as tf:
+                    tf.write(tian_text)
+                    tpath = tf.name
+                try:
+                    print(f"[ngrun] Running Tian stability simulation "
+                          f"(--typ, probe '{probe_label}')...")
+                    stdout, stderr, rc = _run_ngspice(tpath)
+                    if rc != 0:
+                        print(f"[ngrun] ngspice error (rc={rc})")
+                        print((stdout + stderr)[-3000:])
+                        row.update({c: "SIM_ERROR" for c in cols})
+                    else:
+                        stb_res = _extract_tian_measures(stdout, stderr, col_suffix)
+                        row.update(stb_res)
+                        print_tian_summary(stb_res, probe_label=probe_label,
+                                           col_suffix=col_suffix)
+                        if os.path.isfile(raw_file):
+                            print(f"[ngrun] Raw file: {raw_file}")
+                finally:
+                    os.unlink(tpath)
 
     _write_csv(output_file, [row], config)
     print(f"[ngrun] Results written to: {output_file}")
@@ -1032,28 +1076,34 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
     print(f"[3/5] Creating netlists in: {temp_dir}")
 
     sim_args = []
+    n_stb = len(config.stb_list)
     for corner in corners:
         cid = corner["id"]
-        normal_path = tian_path = None
+        normal_path = None
 
         if config.has_out or not config.has_stb:
             normal_path = os.path.join(temp_dir, f"{cid}_norm.sp")
             generator.write_corner_netlist(corner, normal_path)
 
-        if config.has_stb:
-            raw_file  = os.path.join(temp_dir, f"{cid}_tian.raw")
-            tian_path = os.path.join(temp_dir, f"{cid}_tian.sp")
+        tian_jobs = []  # list of (tian_path, col_suffix)
+        for si, stb in enumerate(config.stb_list):
+            col_suffix = _stb_col_suffix(si, n_stb)
+            raw_file  = os.path.join(temp_dir, f"{cid}_tian_{si+1}.raw")
+            tian_path = os.path.join(temp_dir, f"{cid}_tian_{si+1}.sp")
             try:
-                generator.write_tian_netlist(corner, tian_path, raw_file, base_dir)
+                generator.write_tian_netlist(corner, tian_path, raw_file,
+                                             base_dir, stb)
+                tian_jobs.append((tian_path, col_suffix))
             except ValueError as e:
-                print(f"  Warning: Tian probe error for {cid}: {e}")
-                tian_path = None
+                print(f"  Warning: Tian probe error for {cid} "
+                      f"probe '{stb['probe']}': {e}")
+                tian_jobs.append((None, col_suffix))
 
         normal_rawfile = (
             os.path.splitext(normal_path)[0] + ".raw"
             if normal_path else None
         )
-        sim_args.append((corner, normal_path, tian_path, normal_rawfile,
+        sim_args.append((corner, normal_path, tian_jobs, normal_rawfile,
                          config.outputs, config.has_out, config.has_stb))
 
     print(f"  {n} netlist(s) created")
@@ -1128,7 +1178,9 @@ def _fmt_summary_val(val_str: str, col: str) -> str:
     except (ValueError, TypeError):
         return val_str
 
-    unit = _STB_UNITS.get(col)
+    # Strip _N suffix to find base unit (e.g. pm_2 -> pm)
+    base_col = re.sub(r'_\d+$', '', col)
+    unit = _STB_UNITS.get(base_col)
     if unit == "freq":
         if abs(v) >= 1e9:
             return f"{v/1e9:.3f} GHz"
@@ -1159,9 +1211,10 @@ def _print_summary(results: List[Dict], config: NgConfig):
     # Determine which columns to summarise: ng_out measures + stb fields
     measure_cols = list(config.outputs)
     if config.has_stb:
-        for m in STB_MEASURES:
-            if m not in measure_cols:
-                measure_cols.append(m)
+        for si in range(len(config.stb_list)):
+            for m in _stb_columns(si, len(config.stb_list)):
+                if m not in measure_cols:
+                    measure_cols.append(m)
     if not measure_cols:
         return
 
@@ -1258,9 +1311,10 @@ def _write_csv(path: str, results: List[Dict], config: NgConfig):
         if m not in cols:
             cols.append(m)
     if config.has_stb:
-        for m in STB_MEASURES:
-            if m not in cols:
-                cols.append(m)
+        for si in range(len(config.stb_list)):
+            for m in _stb_columns(si, len(config.stb_list)):
+                if m not in cols:
+                    cols.append(m)
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -1312,7 +1366,12 @@ def main():
     print(f"  ngr_lib:    {len(config.libs)} library/libraries")
     print(f"  ngr_temp:   {config.temps or ['25 (default)']}")
     print(f"  ngr_out:    {config.outputs or ['(none)']}")
-    print(f"  ngr_stb:    {config.stb['probe'] if config.has_stb else '(none)'}")
+    if config.has_stb:
+        for si, stb in enumerate(config.stb_list):
+            print(f"  ngr_stb:    [{si+1}] {stb['probe']}"
+                  f"  fstart={stb['fstart']} fstop={stb['fstop']} pts={stb['pts']}")
+    else:
+        print(f"  ngr_stb:    (none)")
     print()
 
     if not config.has_out and not config.has_stb:
@@ -1331,7 +1390,8 @@ def main():
                       f".param statement in the netlist")
 
     if config.has_out and config.has_stb:
-        print("  Note: ngr_out + ngr_stb present - 2 simulations per corner")
+        sims_per = 1 + len(config.stb_list)
+        print(f"  Note: ngr_out + ngr_stb present - {sims_per} simulations per corner")
         print()
 
     print(f"  Mode: {'--typ (single run)' if args.typ else 'corner sweep'}")
