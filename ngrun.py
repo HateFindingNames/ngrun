@@ -742,7 +742,7 @@ class CornerGenerator:
                     })
         return corners
 
-    def build_corner_text(self, corner: Dict) -> str:
+    def build_corner_text(self, corner: Dict, raw_dir: str = None) -> str:
         modified = []
         temp_inserted = False
         for line in self.lines:
@@ -766,6 +766,10 @@ class CornerGenerator:
                 ml = f".temp {corner['temperature']}\n"
                 temp_inserted = True
             modified.append(ml)
+            # Inject 'set rawfile' after .control to redirect bare 'write'
+            if raw_dir is not None and ml.strip().lower().startswith(".control"):
+                raw_path = os.path.join(raw_dir, f"{corner['id']}_norm.raw")
+                modified.append(f"set rawfile = {raw_path}\n")
             if not temp_inserted and re.match(r'^\s*\.(tran|ac|dc|op)\s', ml, re.IGNORECASE):
                 modified[-1] = f".temp {corner['temperature']}\n"
                 modified.append(ml)
@@ -779,9 +783,9 @@ class CornerGenerator:
                 modified.append(f".temp {corner['temperature']}\n")
         return "".join(modified)
 
-    def write_corner_netlist(self, corner: Dict, path: str):
+    def write_corner_netlist(self, corner: Dict, path: str, raw_dir: str = None):
         with open(path, "w") as f:
-            f.write(self.build_corner_text(corner))
+            f.write(self.build_corner_text(corner, raw_dir=raw_dir))
 
     def write_tian_netlist(self, corner: Dict, path: str, raw_file: str,
                           base_dir: str, stb: Dict):
@@ -814,12 +818,8 @@ def _stb_columns(stb_index: int, n_stb: int) -> List[str]:
     return [m + suffix for m in STB_MEASURES]
 
 
-def _run_ngspice(path: str, timeout: int = 600,
-                 rawfile: Optional[str] = None) -> Tuple[str, str, int]:
-    cmd = ["ngspice", "-b"]
-    if rawfile:
-        cmd.append(f"--rawfile={rawfile}")
-    cmd.append(path)
+def _run_ngspice(path: str, timeout: int = 600) -> Tuple[str, str, int]:
+    cmd = ["ngspice", "-b", path]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.stdout, r.stderr, r.returncode
 
@@ -1083,7 +1083,7 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
 
         if config.has_out or not config.has_stb:
             normal_path = os.path.join(temp_dir, f"{cid}_norm.sp")
-            generator.write_corner_netlist(corner, normal_path)
+            generator.write_corner_netlist(corner, normal_path, raw_dir=temp_dir)
 
         tian_jobs = []  # list of (tian_path, col_suffix)
         for si, stb in enumerate(config.stb_list):
