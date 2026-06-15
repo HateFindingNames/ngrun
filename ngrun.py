@@ -103,11 +103,13 @@ import copy
 import csv
 import itertools
 import os
+import datetime
 import re
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+import time
 from typing import Dict, List, Optional, Tuple
 
 
@@ -751,29 +753,34 @@ class CornerGenerator:
                 modified.append(line)
                 continue
             ml = line
+
             for pname, pval in corner["params"].items():
                 pat = r'^(\s*\.param\s+' + re.escape(pname) + r'\s*=\s*)(\S+)(.*)'
                 m = re.match(pat, ml, re.IGNORECASE)
                 if m:
                     ml = f"{m.group(1)}{pval}{m.group(3)}\n"
+
             for (libfile, key), cval in corner["libs"].items():
                 pat = r'^(\s*\.lib\s+)((?:.*/)?)' + re.escape(libfile) + r'(\s+)(\S+)(.*)'
                 m = re.match(pat, ml, re.IGNORECASE)
                 if m:
                     if key is None or m.group(4).strip() == key.strip():
                         ml = f"{m.group(1)}{m.group(2)}{libfile}{m.group(3)}{cval}{m.group(5)}\n"
+
             if re.match(r'^\s*\.temp\s', ml, re.IGNORECASE):
                 ml = f".temp {corner['temperature']}\n"
                 temp_inserted = True
             modified.append(ml)
+
             # Inject 'set rawfile' after .control to redirect bare 'write'
             if raw_dir is not None and ml.strip().lower().startswith(".control"):
                 raw_path = os.path.join(raw_dir, f"{corner['id']}_norm.raw")
-                modified.append(f"set rawfile = {raw_path}\n")
+                modified.append(f'set rawfile = "{raw_path}"\n')
             if not temp_inserted and re.match(r'^\s*\.(tran|ac|dc|op)\s', ml, re.IGNORECASE):
                 modified[-1] = f".temp {corner['temperature']}\n"
                 modified.append(ml)
                 temp_inserted = True
+
         if not temp_inserted:
             for i in range(len(modified) - 1, -1, -1):
                 if re.match(r'^\s*\.end', modified[i], re.IGNORECASE):
@@ -819,8 +826,16 @@ def _stb_columns(stb_index: int, n_stb: int) -> List[str]:
 
 
 def _run_ngspice(path: str, timeout: int = 600) -> Tuple[str, str, int]:
-    cmd = ["ngspice", "-b", path]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    spice_dir = os.path.dirname(os.path.abspath(path))
+    base_dir = os.path.dirname(spice_dir)
+    spice_base_name = os.path.splitext(os.path.basename(path))[0]
+
+    # Put ngspice log next to the generated netlist
+    log = os.path.join(spice_dir, spice_base_name + ".log")
+
+    cmd = ["ngspice", "-b", "-o", log, path]
+    r = subprocess.run(cmd, cwd=base_dir, capture_output=True, text=True, timeout=timeout)
+
     return r.stdout, r.stderr, r.returncode
 
 
@@ -918,6 +933,11 @@ def print_tian_summary(measures: Dict[str, str], corner_id: str = "",
 # ---------------------------------------------------------------------------
 # Per-corner worker (normal + optional Tian)
 # ---------------------------------------------------------------------------
+
+def _row_has_error(row: Dict) -> bool:
+    # Used only for progress display
+    error_tokens = {"SIM_ERROR", "TIMEOUT", "ERROR", "PROBE_ERROR"}
+    return any(v in error_tokens for v in row.values())
 
 def _run_corner_worker(args_tuple) -> Dict:
     """
@@ -1072,8 +1092,18 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
     if not config.has_corners:
         print("  (no ngr_param/ngr_lib/ngr_temp - single nominal corner)")
 
-    temp_dir = tempfile.mkdtemp(prefix="ngrun_")
-    print(f"[3/5] Creating netlists in: {temp_dir}")
+    d = datetime.datetime.now()
+    timestamp = "%04d-%02d-%02d-%02d-%02d" % (d.year, d.month, d.day, d.hour, d.minute)
+    temp_dir = tempfile.mkdtemp(prefix=f"ngrun_{timestamp}_", dir=base_dir)
+    print(f"Temp dir is {os.path.relpath(temp_dir, base_dir)}")
+
+    # Set output dir and name for results csv
+    if output_file:
+        out_base_dir = os.path.dirname(os.path.abspath(output_file))
+        out_base_name = os.path.splitext(os.path.basename(output_file))[0]
+    else:
+        output_file = os.path.join(temp_dir, f"{base_name}_result.csv")
+    print(f"\n[3/5] Creating netlists in: {os.path.relpath(temp_dir, base_dir)}")
 
     sim_args = []
     n_stb = len(config.stb_list)
@@ -1083,7 +1113,8 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
 
         if config.has_out or not config.has_stb:
             normal_path = os.path.join(temp_dir, f"{cid}_norm.sp")
-            generator.write_corner_netlist(corner, normal_path, raw_dir=temp_dir)
+            generator.write_corner_netlist(corner, normal_path, raw_dir=os.path.relpath(temp_dir, base_dir))
+            
 
         tian_jobs = []  # list of (tian_path, col_suffix)
         for si, stb in enumerate(config.stb_list):
@@ -1105,39 +1136,95 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
     print(f"  {n} netlist(s) created")
 
     if no_run:
-        print("[4/5] Skipping simulations (--no-run)")
-        print("[5/5] No results to write")
+        print("\n[4/5] Skipping simulations (--no-run)")
+        print("\n[5/5] No results to write")
         if not keep_netlists:
             import shutil; shutil.rmtree(temp_dir)
         else:
             print(f"  Netlists in: {temp_dir}")
         return
 
-    print(f"[4/5] Running simulations (parallel={parallel})...")
+    print(f"\n[4/5] Running simulations (parallel={parallel})...", flush=True)
     results = []
+    started_at = time.monotonic()
+    num_width = len(str(n))
+
+
+    def report_progress(done: int, cid: str, state: str):
+        # One log line per finished corner
+        elapsed = time.monotonic() - started_at
+        print(
+            f"  [{done:{num_width}d}/{n}]{'':<3}{state:<10}elapsed={elapsed:<.1f}s",
+            flush=True,
+        )
+
+
+    def submit_next(ex, args_iter, running):
+        try:
+            arg = next(args_iter)
+        except StopIteration:
+            return False
+
+        cid = arg[0]["id"]
+        fut = ex.submit(_run_corner_worker, arg)
+        running[fut] = cid
+        print(f"  START{cid:<10}", flush=True)
+        return True
+
 
     if parallel > 1:
+        args_iter = iter(sim_args)
+        running = {}
+        done = 0
+
         with ProcessPoolExecutor(max_workers=parallel) as ex:
-            futures = {ex.submit(_run_corner_worker, a): a for a in sim_args}
-            done = 0
-            for fut in as_completed(futures):
-                try:
-                    results.append(fut.result())
-                except Exception as e:
-                    print(f"  Corner failed: {e}")
-                done += 1
-                if done % max(1, n // 10) == 0 or done == n:
-                    print(f"  {done}/{n} ({100*done//n}%)")
+            # Start only as many jobs as there are workers
+            for _ in range(min(parallel, n)):
+                submit_next(ex, args_iter, running)
+
+            while running:
+                finished, _ = wait(running, return_when=FIRST_COMPLETED)
+
+                for fut in finished:
+                    cid = running.pop(fut)
+
+                    try:
+                        row = fut.result()
+                        results.append(row)
+                        state = "ERROR" if _row_has_error(row) else "OK"
+                    except Exception as e:
+                        state = "FAILED"
+                        print(f"  ERROR   {cid}: {e}", flush=True)
+
+                    done += 1
+                    report_progress(done, cid, state)
+
+                    # Start next corner as soon as one worker is free
+                    submit_next(ex, args_iter, running)
+
     else:
-        for i, arg in enumerate(sim_args):
-            results.append(_run_corner_worker(arg))
-            done = i + 1
-            if done % max(1, n // 10) == 0 or done == n:
-                print(f"  {done}/{n} ({100*done//n}%)")
+        done = 0
+
+        for arg in sim_args:
+            cid = arg[0]["id"]
+
+            print(f"  START   {cid}", flush=True)
+
+            try:
+                row = _run_corner_worker(arg)
+                results.append(row)
+                state = "ERROR" if _row_has_error(row) else "OK"
+            except Exception as e:
+                state = "FAILED"
+                print(f"  ERROR   {cid}: {e}", flush=True)
+
+            done += 1
+            report_progress(done, cid, state)
+
 
     results.sort(key=lambda r: r["corner_id"])
 
-    print(f"[5/5] Writing results to: {output_file}")
+    print(f"\n[5/5] Writing results to: {os.path.relpath(output_file, base_dir)}")
     _write_csv(output_file, results, config)
     print(f"  {len(results)} row(s) written")
 
@@ -1148,9 +1235,9 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
         if config.has_stb:
             print("  Stability raw files removed (use -k to preserve)")
     else:
-        print(f"  Temp directory preserved: {temp_dir}")
+        print(f"  Temp directory preserved: {os.path.relpath(temp_dir, base_dir)}")
         if config.has_stb:
-            print(f"  Stability raw files in:   {temp_dir}")
+            print(f"  Stability raw files in:   {os.path.relpath(temp_dir, base_dir)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1345,7 +1432,7 @@ def main():
         sys.exit(1)
 
     base = os.path.splitext(os.path.basename(args.netlist))[0]
-    output_file = args.output or f"{base}_results.csv"
+    # output_file = args.output or f"{base}_results.csv"
 
     print("╔═══════════════════════════════════════════════════════════════════════════╗")
     print("║                    NGRUN - NGSpice Simulation Tool                        ║")
@@ -1396,7 +1483,7 @@ def main():
     if args.typ:
         run_typ(args.netlist, config, output_file)
     else:
-        run_corners(args.netlist, config, output_file,
+        run_corners(args.netlist, config, args.output,
                     args.parallel, args.keep_netlists, args.no_run)
 
     print()

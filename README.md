@@ -1,3 +1,13 @@
+This is a fork of the original ngrun.py script from [https://github.com/qnzy/ngrun](https://github.com/qnzy/ngrun) with some minor adjustments for my personal liking:
+
+- Moved ``temp_dir`` to the netlists base dir.
+- Added timestamp to the temp dir name.
+- Added some extra info to the terminal (elapsed time per run, etc.).
+- Some visual adjustments to the terminal output.
+- Put output ``*.csv`` file inside ``temp_dir``.
+- Make ``ngspice`` put a ``run.log`` next to the spice files inside ``temp_dir``.
+- Make ``ngspice`` put the ``*.raw`` files next to the spice files inside ``temp_dir``.
+
 # ngrun
 
 NGSpice Corner + Stability Simulation Tool
