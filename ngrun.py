@@ -1011,7 +1011,7 @@ def run_typ(netlist_path: str, config: NgConfig, output_file: str):
             tf.write(netlist_text)
             npath = tf.name
         try:
-            print("[ngrun] Running normal simulation (--typ)...")
+            print("[ngrun] Running normal simulation (--typ)...", flush=True)
             stdout, stderr, rc = _run_ngspice(npath)
             if rc != 0:
                 print(f"[ngrun] ngspice error (rc={rc})")
@@ -1093,9 +1093,13 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
         print("  (no ngr_param/ngr_lib/ngr_temp - single nominal corner)")
 
     d = datetime.datetime.now()
-    timestamp = "%04d-%02d-%02d-%02d-%02d" % (d.year, d.month, d.day, d.hour, d.minute)
-    temp_dir = tempfile.mkdtemp(prefix=f"ngrun_{timestamp}_", dir=base_dir)
-    print(f"Temp dir is {os.path.relpath(temp_dir, base_dir)}")
+    timestamp = "%04d-%02d-%02d-%02d-%02d-%02d" % (d.year, d.month, d.day, d.hour, d.minute, d.second)
+    temp_dir = os.path.join(base_dir, f"ngrun_{timestamp}")
+    try:
+        os.mkdir(temp_dir)
+        print(f"Temp dir is {os.path.join(netlist_path, f'ngrun_{timestamp}')}")
+    except:
+        print(f"⚠️ {base_dir} not writable. Aborting.")
 
     # Set output dir and name for results csv
     if output_file:
@@ -1144,15 +1148,15 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
             print(f"  Netlists in: {temp_dir}")
         return
 
-    print(f"\n[4/5] Running simulations (parallel={parallel})...", flush=True)
+    print(f"\n[4/5] Running simulations (parallel={parallel})...")
     results = []
     started_at = time.monotonic()
     num_width = len(str(n))
 
 
-    def report_progress(done: int, cid: str, state: str):
+    def report_progress(done: int, cid: str, state: str, start: float):
         # One log line per finished corner
-        elapsed = time.monotonic() - started_at
+        elapsed = time.monotonic() - start
         print(
             f"  [{done:{num_width}d}/{n}]{'':<3}{state:<10}elapsed={elapsed:<.1f}s",
             flush=True,
@@ -1166,9 +1170,11 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
             return False
 
         cid = arg[0]["id"]
+        start = time.monotonic()
         fut = ex.submit(_run_corner_worker, arg)
-        running[fut] = cid
-        print(f"  START{cid:<10}", flush=True)
+
+        running[fut] = (cid, start)
+        print(f"  START   {cid}", flush=True)
         return True
 
 
@@ -1186,7 +1192,7 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
                 finished, _ = wait(running, return_when=FIRST_COMPLETED)
 
                 for fut in finished:
-                    cid = running.pop(fut)
+                    cid, start = running.pop(fut)
 
                     try:
                         row = fut.result()
@@ -1197,19 +1203,20 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
                         print(f"  ERROR   {cid}: {e}", flush=True)
 
                     done += 1
-                    report_progress(done, cid, state)
+                    report_progress(done, cid, state, start)
 
                     # Start next corner as soon as one worker is free
                     submit_next(ex, args_iter, running)
 
     else:
         done = 0
+        total_start = time.monotonic()
 
         for arg in sim_args:
             cid = arg[0]["id"]
+            start = time.monotonic()
 
             print(f"  START   {cid}", flush=True)
-
             try:
                 row = _run_corner_worker(arg)
                 results.append(row)
@@ -1219,7 +1226,8 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
                 print(f"  ERROR   {cid}: {e}", flush=True)
 
             done += 1
-            report_progress(done, cid, state)
+            report_progress(done, cid, state, start)
+            print(f"  total time elapsed={time.monotonic() - total_start:<.2f}s")
 
 
     results.sort(key=lambda r: r["corner_id"])
