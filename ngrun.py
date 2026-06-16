@@ -836,7 +836,17 @@ def _run_ngspice(path: str, timeout: int = 600) -> Tuple[str, str, int]:
     cmd = ["ngspice", "-b", "-o", log, path]
     r = subprocess.run(cmd, cwd=base_dir, capture_output=True, text=True, timeout=timeout)
 
-    return r.stdout, r.stderr, r.returncode
+    # Patch to properly extract stuff from ngspice's output again
+    try:
+        with open(log, "r", encoding="utf-8", errors="replace") as f:
+            log_text = f.read()
+    except FileNotFoundError:
+        log_text = ""
+
+    stdout = log_text
+    stderr = (r.stdout or "") + "\n" + (r.stderr or "")
+
+    return stdout, stderr, r.returncode
 
 
 def _extract_measures(output: str, names: List[str]) -> Dict[str, str]:
